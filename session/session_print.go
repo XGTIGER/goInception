@@ -6,6 +6,7 @@ package session
 
 import (
 	"fmt"
+
 	"golang.org/x/net/context"
 
 	json "github.com/CorgiMan/json2"
@@ -30,23 +31,23 @@ func (s *session) printCommand(ctx context.Context, stmtNode ast.StmtNode,
 
 	return nil, nil
 
-	switch node := stmtNode.(type) {
-	case *ast.UseStmt:
-		s.checkChangeDB(node, currentSql)
+	// switch node := stmtNode.(type) {
+	// case *ast.UseStmt:
+	// 	s.checkChangeDB(node, currentSql)
 
-	case *ast.InsertStmt:
-		s.printInsert(node, currentSql)
-	case *ast.DeleteStmt:
-		s.checkDelete(node, currentSql)
-	case *ast.UpdateStmt:
-		s.checkUpdate(node, currentSql)
+	// case *ast.InsertStmt:
+	// 	s.printInsert(node, currentSql)
+	// case *ast.DeleteStmt:
+	// 	s.checkDelete(node, currentSql)
+	// case *ast.UpdateStmt:
+	// 	s.checkUpdate(node, currentSql)
 
-	default:
-		log.Infof("无匹配类型:%T\n", stmtNode)
-		s.AppendErrorNo(ER_NOT_SUPPORTED_YET)
-	}
+	// default:
+	// 	log.Infof("无匹配类型:%T\n", stmtNode)
+	// 	s.AppendErrorNo(ER_NOT_SUPPORTED_YET)
+	// }
 
-	return nil, nil
+	// return nil, nil
 }
 
 func (s *session) printInsert(node *ast.InsertStmt, sql string) {
@@ -60,7 +61,7 @@ func (s *session) printInsert(node *ast.InsertStmt, sql string) {
 
 	table_object := make(map[string]interface{}, 2)
 	if t.Schema.O == "" {
-		table_object["db"] = s.DBName
+		table_object["db"] = s.dbName
 	} else {
 		table_object["db"] = t.Schema.String()
 	}
@@ -71,7 +72,7 @@ func (s *session) printInsert(node *ast.InsertStmt, sql string) {
 		fields := make([]interface{}, 0, len(node.Columns))
 		for _, c := range node.Columns {
 			if c.Schema.O == "" {
-				c.Schema = model.NewCIStr(s.DBName)
+				c.Schema = model.NewCIStr(s.dbName)
 			}
 			if c.Table.O == "" {
 				c.Table = model.NewCIStr(t.Name.O)
@@ -208,10 +209,10 @@ func (s *session) printSelectItem(node ast.ResultSetNode) bool {
 		stmt := x.SelectList
 		for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
 			if sel.Limit != nil {
-				s.AppendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
+				s.appendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
 			}
 			if sel.OrderBy != nil {
-				s.AppendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
+				s.appendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
 			}
 		}
 

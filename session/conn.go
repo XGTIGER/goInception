@@ -18,16 +18,10 @@
 package session
 
 import (
-	"fmt"
-	// "math"
-	// "strings"
 	"database/sql"
+	"fmt"
 	"time"
 
-	// "github.com/hanchuanchuan/goInception/ast"
-	// "github.com/hanchuanchuan/goInception/expression"
-	// "github.com/hanchuanchuan/goInception/mysql"
-	// "github.com/hanchuanchuan/goInception/sessionctx/stmtctx"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/jinzhu/gorm"
 	log "github.com/sirupsen/logrus"
@@ -38,16 +32,15 @@ const maxBadConnRetries = 2
 // createNewConnection 用来创建新的连接
 // 注意: 该方法可能导致driver: bad connection异常
 func (s *session) createNewConnection(dbName string) {
-	addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=Local&maxAllowedPacket=%d",
-		s.opt.user, s.opt.password, s.opt.host, s.opt.port,
-		dbName, s.Inc.DefaultCharset, s.Inc.MaxAllowedPacket)
+	addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=Local&autocommit=1&maxAllowedPacket=%d",
+		s.opt.User, s.opt.Password, s.opt.Host, s.opt.Port,
+		dbName, s.inc.DefaultCharset, s.inc.MaxAllowedPacket)
 
 	db, err := gorm.Open("mysql", addr)
 
 	if err != nil {
-		// log.Error(err)
 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
-		s.AppendErrorMessage(err.Error())
+		s.appendErrorMessage(err.Error())
 		return
 	}
 
@@ -64,120 +57,193 @@ func (s *session) createNewConnection(dbName string) {
 	s.db = db
 }
 
-// Raw 执行sql语句,连接失败时自动重连,自动重置当前数据库
-func (s *session) Raw(sqlStr string) (rows *sql.Rows, err error) {
+// raw 执行sql语句,连接失败时自动重连,自动重置当前数据库
+func (s *session) raw(sqlStr string) (rows *sql.Rows, err error) {
 	// 连接断开无效时,自动重试
 	for i := 0; i < maxBadConnRetries; i++ {
 		rows, err = s.db.DB().Query(sqlStr)
 		if err == nil {
 			return
-		} else {
-			// log.Error(err)
-			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
-			if err == mysqlDriver.ErrInvalidConn {
-				err1 := s.initConnection()
-				if err1 != nil {
-					return rows, err1
-				}
-				s.AppendErrorMessage(mysqlDriver.ErrInvalidConn.Error())
-				continue
-			} else {
-				return
+		}
+		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
+		if err == mysqlDriver.ErrInvalidConn {
+			err1 := s.initConnection()
+			if err1 != nil {
+				return rows, err1
 			}
+			s.appendErrorMessage(mysqlDriver.ErrInvalidConn.Error())
+			continue
+		} else {
+			return
 		}
 	}
 	return
 }
 
-// Raw 执行sql语句,连接失败时自动重连,自动重置当前数据库
-func (s *session) Exec(sqlStr string, retry bool) (res sql.Result, err error) {
+// exec 执行sql语句,连接失败时自动重连,自动重置当前数据库
+func (s *session) exec(sqlStr string, retry bool) (res sql.Result, err error) {
 	// 连接断开无效时,自动重试
 	for i := 0; i < maxBadConnRetries; i++ {
 		res, err = s.db.DB().Exec(sqlStr)
 		if err == nil {
 			return
-		} else {
-			// log.Error(err)
-			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
-			if err == mysqlDriver.ErrInvalidConn {
-				err1 := s.initConnection()
-				if err1 != nil {
-					return res, err1
-				}
-				if retry {
-					s.AppendErrorMessage(mysqlDriver.ErrInvalidConn.Error())
-					continue
-				} else {
-					return
-				}
-			}
-			return
 		}
-	}
-	return
-}
-
-// Raw 执行sql语句,连接失败时自动重连,自动重置当前数据库
-func (s *session) RawScan(sqlStr string, dest interface{}) (err error) {
-	// 连接断开无效时,自动重试
-	for i := 0; i < maxBadConnRetries; i++ {
-		err = s.db.Raw(sqlStr).Scan(dest).Error
-		if err == nil {
-			return
-		} else {
-			if err == mysqlDriver.ErrInvalidConn {
-				// log.Error(err)
-				log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
-				err1 := s.initConnection()
-				if err1 != nil {
-					return err1
-				}
-				s.AppendErrorMessage(mysqlDriver.ErrInvalidConn.Error())
+		log.Errorf("con:%d %v sql:%s", s.sessionVars.ConnectionID, err, sqlStr)
+		if err == mysqlDriver.ErrInvalidConn {
+			err1 := s.initConnection()
+			if err1 != nil {
+				return res, err1
+			}
+			if retry {
+				s.appendErrorMessage(mysqlDriver.ErrInvalidConn.Error())
 				continue
 			} else {
 				return
 			}
 		}
+		return
+	}
+	return
+}
+
+// execDDL 执行sql语句,连接失败时自动重连,自动重置当前数据库
+func (s *session) execDDL(sqlStr string, retry bool) (res sql.Result, err error) {
+	// 连接断开无效时,自动重试
+	for i := 0; i < maxBadConnRetries; i++ {
+		res, err = s.ddlDB.DB().Exec(sqlStr)
+		if err == nil {
+			return
+		}
+		log.Errorf("con:%d %v sql:%s", s.sessionVars.ConnectionID, err, sqlStr)
+		if err == mysqlDriver.ErrInvalidConn {
+			err1 := s.initConnection()
+			if err1 != nil {
+				return res, err1
+			}
+			if retry {
+				s.appendErrorMessage(mysqlDriver.ErrInvalidConn.Error())
+				continue
+			} else {
+				return
+			}
+		}
+		return
+	}
+	return
+}
+
+// Raw 执行sql语句,连接失败时自动重连,自动重置当前数据库
+func (s *session) rawScan(sqlStr string, dest interface{}) (err error) {
+	// 连接断开无效时,自动重试
+	for i := 0; i < maxBadConnRetries; i++ {
+		err = s.db.Raw(sqlStr).Scan(dest).Error
+		if err == nil {
+			return
+		}
+		if err == mysqlDriver.ErrInvalidConn {
+			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
+			err1 := s.initConnection()
+			if err1 != nil {
+				return err1
+			}
+			s.appendErrorMessage(mysqlDriver.ErrInvalidConn.Error())
+			continue
+		}
+		return
 	}
 	return
 }
 
 // initConnection 连接失败时自动重连,重连后重置当前数据库
 func (s *session) initConnection() (err error) {
-	name := s.DBName
+	name := s.dbName
 	if name == "" {
-		name = "mysql"
+		name = s.opt.db
 	}
 
 	// 连接断开无效时,自动重试
 	for i := 0; i < maxBadConnRetries; i++ {
-		if err = s.db.Exec(fmt.Sprintf("USE `%s`", name)).Error; err == nil {
+		if name == "" {
+			err = s.db.DB().Ping()
+		} else {
+			err = s.db.Exec(fmt.Sprintf("USE `%s`", name)).Error
+		}
+		if err == nil {
 			// 连接重连时,清除线程ID缓存
 			// s.threadID = 0
 			log.Infof("con:%d 数据库断开重连", s.sessionVars.ConnectionID)
 			return
-		} else {
-			// log.Error(err)
-			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
-			if err != mysqlDriver.ErrInvalidConn {
-				if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
-					s.AppendErrorMessage(myErr.Message)
-				} else {
-					s.AppendErrorMessage(err.Error())
-				}
-				return
+		}
+
+		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
+		if err != mysqlDriver.ErrInvalidConn {
+			if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
+				s.appendErrorMessage(myErr.Message)
+			} else {
+				s.appendErrorMessage(err.Error())
 			}
+			return
 		}
 	}
 
 	if err != nil {
-		// log.Error(err)
 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
 		if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
-			s.AppendErrorMessage(myErr.Message)
+			s.appendErrorMessage(myErr.Message)
 		} else {
-			s.AppendErrorMessage(err.Error())
+			s.appendErrorMessage(err.Error())
 		}
 	}
 	return
 }
+
+// // SwitchDatabase USE切换到当前数据库. (避免连接断开后当前数据库置空)
+// func (s *session) SwitchDatabase(db *gorm.DB) error {
+// 	name := s.DBName
+// 	if name == "" {
+// 		name = s.opt.db
+// 	}
+// 	if name == "" {
+// 		return nil
+// 	}
+
+// 	// log.Infof("SwitchDatabase: %v", name)
+// 	_, err := db.DB().Exec(fmt.Sprintf("USE `%s`", name))
+// 	if err != nil {
+// 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
+// 		if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
+// 			s.AppendErrorMessage(myErr.Message)
+// 		} else {
+// 			s.AppendErrorMessage(err.Error())
+// 		}
+// 	}
+// 	return err
+// }
+
+// // GetDatabase 获取当前数据库
+// func (s *session) GetDatabase() string {
+// 	log.Debug("GetDatabase")
+
+// 	var value string
+// 	sql := "select database();"
+
+// 	rows, err := s.Raw(sql)
+// 	if rows != nil {
+// 		defer rows.Close()
+// 	}
+
+// 	if err != nil {
+// 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
+// 		if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
+// 			s.AppendErrorMessage(myErr.Message)
+// 		} else {
+// 			s.AppendErrorMessage(err.Error())
+// 		}
+// 	} else {
+// 		for rows.Next() {
+// 			rows.Scan(&value)
+// 		}
+// 	}
+
+// 	return value
+// }

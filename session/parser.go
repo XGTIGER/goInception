@@ -14,18 +14,18 @@ import (
 	"unicode/utf8"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/hanchuanchuan/go-mysql/mysql"
+	"github.com/hanchuanchuan/go-mysql/replication"
 	"github.com/juju/errors"
 	"github.com/shopspring/decimal"
-	"github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/replication"
 	log "github.com/sirupsen/logrus"
 )
 
 const digits01 = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
 const digits10 = "0000000000111111111122222222223333333333444444444455555555556666666666777777777788888888889999999999"
 
-// ChanData 备份channal数据,用来传递备份的sql等信息
-type ChanData struct {
+// chanData 备份channal数据,用来传递备份的sql等信息
+type chanData struct {
 	sql    []byte // dml动态解析的语句
 	sqlStr string // ddl回滚语句
 	e      *replication.BinlogEvent
@@ -35,7 +35,7 @@ type ChanData struct {
 	record *Record
 }
 
-func (s *session) ProcessChan(wg *sync.WaitGroup) {
+func (s *session) processChan(wg *sync.WaitGroup) {
 	for {
 		r := <-s.ch
 
@@ -60,7 +60,7 @@ func (s *session) ProcessChan(wg *sync.WaitGroup) {
 	}
 }
 
-func (s *session) GetNextBackupRecord() *Record {
+func (s *session) getNextBackupRecord() *Record {
 	for {
 		r := s.recordSets.Next()
 		if r == nil {
@@ -69,7 +69,7 @@ func (s *session) GetNextBackupRecord() *Record {
 
 		if r.TableInfo != nil {
 
-			lastBackupTable := fmt.Sprintf("`%s`.`%s`", r.BackupDBName, r.TableInfo.Name)
+			lastBackupTable := fmt.Sprintf("`%s`.`%s`", s.getRemoteBackupDBName(r), r.TableInfo.Name)
 
 			if s.lastBackupTable == "" {
 				s.lastBackupTable = lastBackupTable
@@ -77,11 +77,11 @@ func (s *session) GetNextBackupRecord() *Record {
 
 			if s.checkSqlIsDDL(r) {
 				if s.lastBackupTable != lastBackupTable {
-					s.ch <- &ChanData{sql: nil, table: s.lastBackupTable, record: s.myRecord}
+					s.ch <- &chanData{sql: nil, table: s.lastBackupTable, record: s.myRecord}
 					s.lastBackupTable = lastBackupTable
 				}
 
-				s.ch <- &ChanData{sqlStr: r.DDLRollback, opid: r.OPID,
+				s.ch <- &chanData{sqlStr: r.DDLRollback, opid: r.OPID,
 					table: s.lastBackupTable, record: r}
 
 				if r.StageStatus != StatusExecFail {
@@ -102,7 +102,7 @@ func (s *session) GetNextBackupRecord() *Record {
 				}
 
 				if s.lastBackupTable != lastBackupTable {
-					s.ch <- &ChanData{sql: nil, table: s.lastBackupTable, record: s.myRecord}
+					s.ch <- &chanData{sql: nil, table: s.lastBackupTable, record: s.myRecord}
 					s.lastBackupTable = lastBackupTable
 				}
 
@@ -173,14 +173,14 @@ func clearDeleteColumns(t *TableInfo) {
 	t.IsClear = true
 }
 
-func (s *session) Parser(ctx context.Context) {
+func (s *session) parserBinlog(ctx context.Context) {
 
 	// var err error
 	var wg sync.WaitGroup
 
 	wg.Add(1)
-	s.ch = make(chan *ChanData, 50)
-	go s.ProcessChan(&wg)
+	s.ch = make(chan *chanData, 50)
+	go s.processChan(&wg)
 
 	// 最终关闭和返回
 	defer func() {
@@ -193,7 +193,7 @@ func (s *session) Parser(ctx context.Context) {
 	}()
 
 	// 获取binlog解析起点
-	record := s.GetNextBackupRecord()
+	record := s.getNextBackupRecord()
 	if record == nil {
 		return
 	}
@@ -206,7 +206,7 @@ func (s *session) Parser(ctx context.Context) {
 	// s.backupdb.LogMode(true)
 
 	flavor := "mysql"
-	if s.DBType == DBTypeMariaDB {
+	if s.dbType == DBTypeMariaDB {
 		flavor = "mariadb"
 	}
 
@@ -218,8 +218,8 @@ func (s *session) Parser(ctx context.Context) {
 		host = s.opt.parseHost
 		port = uint16(s.opt.parsePort)
 	} else {
-		host = s.opt.host
-		port = uint16(s.opt.port)
+		host = s.opt.Host
+		port = uint16(s.opt.Port)
 	}
 	cfg := replication.BinlogSyncerConfig{
 		ServerID: 2000111111 + uint32(s.sessionVars.ConnectionID%10000),
@@ -227,8 +227,8 @@ func (s *session) Parser(ctx context.Context) {
 
 		Host:       host,
 		Port:       port,
-		User:       s.opt.user,
-		Password:   s.opt.password,
+		User:       s.opt.User,
+		Password:   s.opt.Password,
 		UseDecimal: true,
 		// RawModeEnabled:  p.cfg.RawMode,
 		// SemiSyncEnabled: p.cfg.SemiSync,
@@ -237,15 +237,17 @@ func (s *session) Parser(ctx context.Context) {
 	b := replication.NewBinlogSyncer(cfg)
 	defer b.Close()
 
-	startPosition := mysql.Position{record.StartFile, uint32(record.StartPosition)}
-	stopPosition := mysql.Position{record.EndFile, uint32(record.EndPosition)}
+	startPosition := mysql.Position{Name: record.StartFile,
+		Pos: uint32(record.StartPosition)}
+	stopPosition := mysql.Position{Name: record.EndFile,
+		Pos: uint32(record.EndPosition)}
 	s.lastBackupTable = fmt.Sprintf("`%s`.`%s`", record.BackupDBName, record.TableInfo.Name)
 	startTime := time.Now()
 
 	logSync, err := b.StartSync(startPosition)
 	if err != nil {
 		log.Infof("Start sync error: %v\n", errors.ErrorStack(err))
-		s.AppendErrorMessage(err.Error())
+		s.appendErrorMessage(err.Error())
 		return
 	}
 
@@ -255,11 +257,29 @@ func (s *session) Parser(ctx context.Context) {
 	// 已解析行数，如果行数大于等于record的实际受影响行数，则可以直接切换到下一record
 	var changeRows int
 
+	defer func() {
+		if err := recover(); err != nil {
+			log.Errorf("ERROR!! BUG!!")
+			if s.myRecord != nil {
+				log.Errorf("error parsing table `%s`.`%s`. sql: %s",
+					s.myRecord.DBName, s.myRecord.TableName, s.myRecord.Sql)
+				log.Errorf("binlog info: start pos: %s:%d, end pos: %s:%d. thread id: %d",
+					s.myRecord.StartFile, s.myRecord.StartPosition,
+					s.myRecord.EndFile, s.myRecord.EndPosition,
+					s.myRecord.ThreadId)
+				log.Errorf("%#v", s.myRecord)
+			}
+			log.Errorf("current pos: %s", currentPosition.String())
+			log.Errorf("%#v", err)
+			s.appendErrorMessage(fmt.Sprintf("%#v", err))
+		}
+	}()
+
 	for {
 		e, err := logSync.GetEvent(context.Background())
 		if err != nil {
 			log.Infof("Get event error: %v\n", errors.ErrorStack(err))
-			s.AppendErrorMessage(err.Error())
+			s.appendErrorMessage(err.Error())
 			break
 		}
 
@@ -269,8 +289,8 @@ func (s *session) Parser(ctx context.Context) {
 
 		if e.Header.EventType == replication.ROTATE_EVENT {
 			if event, ok := e.Event.(*replication.RotateEvent); ok {
-				currentPosition = mysql.Position{string(event.NextLogName),
-					uint32(event.Position)}
+				currentPosition = mysql.Position{Name: string(event.NextLogName),
+					Pos: uint32(event.Position)}
 			}
 		}
 
@@ -278,6 +298,12 @@ func (s *session) Parser(ctx context.Context) {
 		if currentPosition.Compare(startPosition) == -1 {
 			continue
 		}
+
+		// log.Errorf("binlog pos: %d", int(currentPosition.Pos))
+		// log.Errorf("binlog pos: %v", e.Header.EventType.String())
+		// log.Errorf("currentThreadID: %v", currentThreadID)
+		// e.Dump(os.Stdout)
+		// os.Stdout.Sync()
 
 		switch e.Header.EventType {
 		case replication.TABLE_MAP_EVENT:
@@ -289,8 +315,17 @@ func (s *session) Parser(ctx context.Context) {
 			}
 
 		case replication.QUERY_EVENT:
-			if event, ok := e.Event.(*replication.QueryEvent); ok {
-				currentThreadID = event.SlaveProxyID
+			// if event, ok := e.Event.(*replication.QueryEvent); ok {
+			// 	// currentThreadID = event.SlaveProxyID
+			// 	log.Error(string(event.Query))
+			// }
+
+			if s.dbType == DBTypeMariaDB && s.dbVersion >= 100000 {
+				goto ENDCHECK
+			} else {
+				if event, ok := e.Event.(*replication.QueryEvent); ok {
+					currentThreadID = event.SlaveProxyID
+				}
 			}
 
 		case replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
@@ -351,10 +386,12 @@ func (s *session) Parser(ctx context.Context) {
 
 			record.BackupCostTime = fmt.Sprintf("%.3f", time.Since(startTime).Seconds())
 
-			next := s.GetNextBackupRecord()
+			next := s.getNextBackupRecord()
 			if next != nil {
-				startPosition = mysql.Position{next.StartFile, uint32(next.StartPosition)}
-				stopPosition = mysql.Position{next.EndFile, uint32(next.EndPosition)}
+				startPosition = mysql.Position{Name: next.StartFile,
+					Pos: uint32(next.StartPosition)}
+				stopPosition = mysql.Position{Name: next.EndFile,
+					Pos: uint32(next.EndPosition)}
 				startTime = time.Now()
 
 				s.myRecord = next
@@ -363,17 +400,20 @@ func (s *session) Parser(ctx context.Context) {
 				break
 			}
 		} else if s.opt.tranBatch > 1 {
-			if record.AffectedRows <= changeRows {
+			if changeRows >= record.AffectedRows &&
+				(s.dbType != DBTypeMariaDB || s.dbVersion < 100000) {
 				if record.AffectedRows > 0 {
 					record.StageStatus = StatusBackupOK
 				}
 				record.BackupCostTime = fmt.Sprintf("%.3f", time.Since(startTime).Seconds())
 
 				changeRows = 0
-				next := s.GetNextBackupRecord()
+				next := s.getNextBackupRecord()
 				if next != nil {
-					startPosition = mysql.Position{next.StartFile, uint32(next.StartPosition)}
-					stopPosition = mysql.Position{next.EndFile, uint32(next.EndPosition)}
+					startPosition = mysql.Position{Name: next.StartFile,
+						Pos: uint32(next.StartPosition)}
+					stopPosition = mysql.Position{Name: next.EndFile,
+						Pos: uint32(next.EndPosition)}
 					startTime = time.Now()
 
 					s.myRecord = next
@@ -389,7 +429,7 @@ func (s *session) Parser(ctx context.Context) {
 			// 进程Killed
 			if err := checkClose(ctx); err != nil {
 				log.Warn("Killed: ", err)
-				s.AppendErrorMessage("Operation has been killed!")
+				s.appendErrorMessage("Operation has been killed!")
 				break
 			}
 		}
@@ -410,9 +450,9 @@ func (s *session) checkFilter(event *replication.RowsEvent,
 		return false
 	}
 
-	if currentThreadID == 0 && s.DBType == DBTypeMariaDB {
+	if currentThreadID == 0 && s.dbType == DBTypeMariaDB {
 		if record.ErrLevel != 1 {
-			record.AppendErrorNo(ErrNotFoundThreadId, s.DBVersion)
+			record.appendErrorNo(s.inc.Lang, ErrNotFoundThreadId, s.dbVersion)
 		}
 		return true
 	} else if record.ThreadId != currentThreadID {
@@ -451,9 +491,9 @@ func (s *session) checkUpdateFilter(event *replication.RowsEvent,
 		}
 	}
 
-	if currentThreadID == 0 && s.DBType == DBTypeMariaDB {
+	if currentThreadID == 0 && s.dbType == DBTypeMariaDB {
 		if record.ErrLevel != 1 {
-			record.AppendErrorNo(ErrNotFoundThreadId, s.DBVersion)
+			record.appendErrorNo(s.inc.Lang, ErrNotFoundThreadId, s.dbVersion)
 		}
 		return true, multiTable
 	} else if record.ThreadId != currentThreadID {
@@ -493,21 +533,22 @@ func (s *session) flush(table string, record *Record) {
 		const rowSQL = "(?,?),"
 		sql := "insert into %s(rollback_statement,opid_time) values%s"
 		values := strings.TrimRight(strings.Repeat(rowSQL, len(s.insertBuffer)/2), ",")
-
-		err := s.backupdb.Exec(fmt.Sprintf(sql, table, values),
+		sql = fmt.Sprintf(sql, table, values)
+		err := s.backupdb.Exec(sql,
 			s.insertBuffer...).Error
 		if err != nil {
+			record.StageStatus = StatusBackupFail
 			if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
-				record.StageStatus = StatusBackupFail
-				record.AppendErrorMessage(myErr.Message)
-				// log.Error(fmt.Sprintf(sql, table, values))
-				// log.Error(s.insertBuffer)
-				log.Error(myErr)
+				record.appendErrorMessage(myErr.Message)
+			} else {
+				s.appendErrorMessage(err.Error())
 			}
+			log.Errorf("con:%d %v sql:%s params:%v",
+				s.sessionVars.ConnectionID, err, sql, s.insertBuffer)
 		}
-		s.BackupTotalRows += len(s.insertBuffer) / 2
+		s.backupTotalRows += len(s.insertBuffer) / 2
 		s.SetMyProcessInfo(record.Sql, time.Now(),
-			float64(s.BackupTotalRows)/float64(s.TotalChangeRows))
+			float64(s.backupTotalRows)/float64(s.totalChangeRows))
 	}
 	s.insertBuffer = nil
 }
@@ -530,9 +571,10 @@ func (s *session) write(b []byte, binEvent *replication.BinlogEvent) {
 	if s.myRecord.StageStatus == StatusExecFail {
 		log.Info("auto fix record:", s.myRecord.OPID)
 		s.myRecord.AffectedRows += 1
-		s.TotalChangeRows += 1
+		s.totalChangeRows += 1
 	}
-	s.ch <- &ChanData{sql: b, e: binEvent, opid: s.myRecord.OPID,
+
+	s.ch <- &chanData{sql: b, e: binEvent, opid: s.myRecord.OPID,
 		table: s.lastBackupTable, record: s.myRecord}
 }
 
@@ -563,7 +605,7 @@ func (s *session) generateInsertSql(t *TableInfo, e *replication.RowsEvent,
 
 		var vv []driver.Value
 		for i, d := range rows {
-			if t.Fields[i].IsUnsigned() {
+			if t.Fields[i].isUnsigned() {
 				d = processValue(d, GetDataTypeBase(t.Fields[i].Type))
 			}
 			vv = append(vv, d)
@@ -574,7 +616,7 @@ func (s *session) generateInsertSql(t *TableInfo, e *replication.RowsEvent,
 			// }
 		}
 
-		r, err := InterpolateParams(sql, vv, s.Inc.HexBlob)
+		r, err := interpolateParams(sql, vv, s.inc.HexBlob)
 		if err != nil {
 			log.Error(err)
 		}
@@ -609,7 +651,7 @@ func (s *session) generateDeleteSql(t *TableInfo, e *replication.RowsEvent,
 			if t.hasPrimary {
 				_, ok := t.primarys[i]
 				if ok {
-					if t.Fields[i].IsUnsigned() {
+					if t.Fields[i].isUnsigned() {
 						d = processValue(d, GetDataTypeBase(t.Fields[i].Type))
 					}
 					vv = append(vv, d)
@@ -622,7 +664,7 @@ func (s *session) generateDeleteSql(t *TableInfo, e *replication.RowsEvent,
 					}
 				}
 			} else {
-				if t.Fields[i].IsUnsigned() {
+				if t.Fields[i].isUnsigned() {
 					d = processValue(d, GetDataTypeBase(t.Fields[i].Type))
 				}
 				vv = append(vv, d)
@@ -639,7 +681,7 @@ func (s *session) generateDeleteSql(t *TableInfo, e *replication.RowsEvent,
 		}
 		newSql := strings.Join([]string{sql, strings.Join(columnNames, " AND")}, "")
 
-		r, err := InterpolateParams(newSql, vv, s.Inc.HexBlob)
+		r, err := interpolateParams(newSql, vv, s.inc.HexBlob)
 		if err != nil {
 			log.Error(err)
 		}
@@ -690,8 +732,6 @@ func processValue(value driver.Value, dataType string) driver.Value {
 		// log.Errorf("%T", v)
 		return value
 	}
-
-	return value
 }
 
 func abs(n int64) int64 {
@@ -719,7 +759,7 @@ func (s *session) generateUpdateSql(t *TableInfo, e *replication.RowsEvent,
 	var sets []string
 
 	// 最小化回滚语句, 当开启时,update语句中未变更的值不再记录到回滚语句中
-	minimalMode := s.Inc.EnableMinimalRollback
+	minimalMode := s.inc.EnableMinimalRollback
 
 	if !minimalMode {
 		for i, col := range t.Fields {
@@ -764,7 +804,7 @@ func (s *session) generateUpdateSql(t *TableInfo, e *replication.RowsEvent,
 					}
 					// 最小化模式下,列如果相等则省略
 					if !equal {
-						if t.Fields[j].IsUnsigned() {
+						if t.Fields[j].isUnsigned() {
 							d = processValue(d, GetDataTypeBase(t.Fields[j].Type))
 						}
 						newValues = append(newValues, d)
@@ -773,7 +813,7 @@ func (s *session) generateUpdateSql(t *TableInfo, e *replication.RowsEvent,
 						}
 					}
 				} else {
-					if t.Fields[j].IsUnsigned() {
+					if t.Fields[j].isUnsigned() {
 						d = processValue(d, GetDataTypeBase(t.Fields[j].Type))
 					}
 					newValues = append(newValues, d)
@@ -785,7 +825,7 @@ func (s *session) generateUpdateSql(t *TableInfo, e *replication.RowsEvent,
 			for j, d := range rows {
 				if t.hasPrimary {
 					if _, ok := t.primarys[j]; ok {
-						if t.Fields[j].IsUnsigned() {
+						if t.Fields[j].isUnsigned() {
 							d = processValue(d, GetDataTypeBase(t.Fields[j].Type))
 						}
 						oldValues = append(oldValues, d)
@@ -799,7 +839,7 @@ func (s *session) generateUpdateSql(t *TableInfo, e *replication.RowsEvent,
 						}
 					}
 				} else {
-					if t.Fields[j].IsUnsigned() {
+					if t.Fields[j].isUnsigned() {
 						d = processValue(d, GetDataTypeBase(t.Fields[j].Type))
 					}
 					oldValues = append(oldValues, d)
@@ -821,7 +861,7 @@ func (s *session) generateUpdateSql(t *TableInfo, e *replication.RowsEvent,
 			}
 			newSql = strings.Join([]string{sql, strings.Join(columnNames, " AND")}, "")
 			newValues = append(newValues, oldValues...)
-			r, err := InterpolateParams(newSql, newValues, s.Inc.HexBlob)
+			r, err := interpolateParams(newSql, newValues, s.inc.HexBlob)
 			if err != nil {
 				log.Error(err)
 			}
@@ -836,7 +876,7 @@ func (s *session) generateUpdateSql(t *TableInfo, e *replication.RowsEvent,
 	return string(buf), nil
 }
 
-func InterpolateParams(query string, args []driver.Value, hexBlob bool) ([]byte, error) {
+func interpolateParams(query string, args []driver.Value, hexBlob bool) ([]byte, error) {
 	// Number of ? should be same to len(args)
 	if strings.Count(query, "?") != len(args) {
 		log.Error("sql", query, "需要参数", strings.Count(query, "?"),

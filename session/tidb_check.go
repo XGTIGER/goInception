@@ -22,18 +22,26 @@ import (
 	"math"
 	"reflect"
 	"strings"
-	// "time"
 
 	"github.com/hanchuanchuan/goInception/ast"
-	"github.com/hanchuanchuan/goInception/expression"
 	"github.com/hanchuanchuan/goInception/mysql"
-	"github.com/hanchuanchuan/goInception/planner/core"
-	// "github.com/hanchuanchuan/goInception/sessionctx/stmtctx"
 	"github.com/hanchuanchuan/goInception/types"
 	"github.com/hanchuanchuan/goInception/util/charset"
 	"github.com/pingcap/errors"
-	// log "github.com/sirupsen/logrus"
 )
+
+const (
+	// ErrExprInSelect  is in select fields for the error of ErrFieldNotInGroupBy
+	ErrExprInSelect = "SELECT list"
+	// ErrExprInOrderBy  is in order by items for the error of ErrFieldNotInGroupBy
+	ErrExprInOrderBy = "ORDER BY"
+)
+
+// ErrExprLoc is for generate the ErrFieldNotInGroupBy error info
+type ErrExprLoc struct {
+	Offset int
+	Loc    string
+}
 
 // checkContainDotColumn checks field contains the table name.
 // for example :create table t (c1.c2 int default null).
@@ -44,10 +52,10 @@ func (s *session) checkContainDotColumn(stmt *ast.CreateTableStmt) {
 	for _, colDef := range stmt.Cols {
 		// check schema and table names.
 		if colDef.Name.Schema.O != sName && len(colDef.Name.Schema.O) != 0 {
-			s.AppendErrorNo(ER_WRONG_DB_NAME, colDef.Name.Schema.O)
+			s.appendErrorNo(ER_WRONG_DB_NAME, colDef.Name.Schema.O)
 		}
 		if colDef.Name.Table.O != tName && len(colDef.Name.Table.O) != 0 {
-			s.AppendErrorNo(ER_WRONG_TABLE_NAME, colDef.Name.Table.O)
+			s.appendErrorNo(ER_WRONG_TABLE_NAME, colDef.Name.Table.O)
 		}
 	}
 }
@@ -62,9 +70,9 @@ func (s *session) checkAutoIncrement(stmt *ast.CreateTableStmt) {
 	for _, colDef := range stmt.Cols {
 		var hasAutoIncrement bool
 		for i, op := range colDef.Options {
-			ok, err := checkAutoIncrementOp(colDef, i)
+			ok, err := s.checkAutoIncrementOp(colDef, i)
 			if err != nil {
-				s.AppendErrorMessage(err.Error())
+				s.appendErrorMessage(err.Error())
 				// return
 			}
 			if ok {
@@ -94,14 +102,14 @@ func (s *session) checkAutoIncrement(stmt *ast.CreateTableStmt) {
 		}
 	}
 	if (autoIncrementMustBeKey && !isKey) || count > 1 {
-		s.AppendErrorNo(ER_WRONG_AUTO_KEY)
+		s.appendErrorNo(ER_WRONG_AUTO_KEY)
 	}
 
 	switch autoIncrementCol.Tp.Tp {
 	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeLong,
 		mysql.TypeFloat, mysql.TypeDouble, mysql.TypeLonglong, mysql.TypeInt24:
 	default:
-		s.AppendErrorMessage(
+		s.appendErrorMessage(
 			fmt.Sprintf("Incorrect column specifier for column '%s'", autoIncrementCol.Name.Name.O))
 	}
 }
@@ -123,7 +131,7 @@ func isConstraintKeyTp(constraints []*ast.Constraint, colDef *ast.ColumnDef) boo
 	return false
 }
 
-func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
+func (s *session) checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
 	var hasAutoIncrement bool
 
 	if colDef.Options[num].Tp == ast.ColumnOptionAutoIncrement {
@@ -134,7 +142,7 @@ func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
 		for _, op := range colDef.Options[num+1:] {
 			if op.Tp == ast.ColumnOptionDefaultValue && !op.Expr.GetDatum().IsNull() {
 				return hasAutoIncrement,
-					errors.Errorf(fmt.Sprintf(GetErrorMessage(ER_INVALID_DEFAULT), colDef.Name.Name.O))
+					errors.Errorf(fmt.Sprintf(s.getErrorMessage(ER_INVALID_DEFAULT), colDef.Name.Name.O))
 			}
 		}
 	}
@@ -145,7 +153,7 @@ func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
 		for _, op := range colDef.Options[num+1:] {
 			if op.Tp == ast.ColumnOptionAutoIncrement {
 				return hasAutoIncrement,
-					errors.Errorf(fmt.Sprintf(GetErrorMessage(ER_INVALID_DEFAULT), colDef.Name.Name.O))
+					errors.Errorf(fmt.Sprintf(s.getErrorMessage(ER_INVALID_DEFAULT), colDef.Name.Name.O))
 			}
 		}
 	}
@@ -158,7 +166,7 @@ func (s *session) checkDuplicateColumnName(indexColNames []*ast.IndexColName) {
 	for _, indexColName := range indexColNames {
 		name := indexColName.Column.Name
 		if _, ok := colNames[name.L]; ok {
-			s.AppendErrorNo(ER_DUP_FIELDNAME, name)
+			s.appendErrorNo(ER_DUP_FIELDNAME, name)
 		}
 		colNames[name.L] = struct{}{}
 	}
@@ -169,8 +177,8 @@ func (s *session) checkIndexInfo(tableName, indexName string, indexColNames []*a
 	// if strings.EqualFold(indexName, mysql.PrimaryKeyName) {
 	// 	s.AppendErrorNo(ER_WRONG_NAME_FOR_INDEX, indexName, tableName)
 	// }
-	if s.Inc.MaxKeyParts > 0 && len(indexColNames) > int(s.Inc.MaxKeyParts) {
-		s.AppendErrorNo(ER_TOO_MANY_KEY_PARTS, indexName, "", s.Inc.MaxKeyParts)
+	if s.inc.MaxKeyParts > 0 && len(indexColNames) > int(s.inc.MaxKeyParts) {
+		s.appendErrorNo(ER_TOO_MANY_KEY_PARTS, indexName, "", s.inc.MaxKeyParts)
 	}
 	s.checkDuplicateColumnName(indexColNames)
 }
@@ -203,7 +211,7 @@ func (s *session) isInvalidDefaultValue(colDef *ast.ColumnDef) bool {
 					return false
 				}
 
-				d, err := expression.GetTimeValue(s, columnOpt.Expr, tp.Tp, tp.Decimal)
+				d, err := GetTimeValue(s, columnOpt.Expr, tp.Tp, tp.Decimal)
 				if err != nil {
 					// log.Warning(err)
 					return true
@@ -216,7 +224,7 @@ func (s *session) isInvalidDefaultValue(colDef *ast.ColumnDef) bool {
 				// log.Info(vars.StrictSQLMode, vars.SQLMode.HasNoZeroDateMode(), t.IsZero())
 				// log.Info(vars.StrictSQLMode, vars.SQLMode.HasNoZeroInDateMode(), t.InvalidZero())
 				if t.IsZero() {
-					if s.Inc.EnableZeroDate {
+					if s.inc.EnableZeroDate {
 						return vars.StrictSQLMode && vars.SQLMode.HasNoZeroDateMode()
 					} else {
 						return true
@@ -269,13 +277,14 @@ func isIncorrectName(name string) bool {
 func (s *session) checkCreateTableGrammar(stmt *ast.CreateTableStmt) {
 	tName := stmt.Table.Name.String()
 	if isIncorrectName(tName) {
-		s.AppendErrorNo(ER_WRONG_TABLE_NAME, tName)
+		s.appendErrorNo(ER_WRONG_TABLE_NAME, tName)
 	}
 	countPrimaryKey := 0
 	for _, colDef := range stmt.Cols {
-		if err := s.checkColumn(colDef); err != nil {
-			s.AppendErrorMessage(err.Error())
-		}
+		// 放在mysqlCheckField函数统一检查(create/alter)
+		// if err := s.checkColumn(colDef); err != nil {
+		// 	s.AppendErrorMessage(err.Error())
+		// }
 		countPrimaryKey += isPrimary(colDef.Options)
 	}
 	for _, constraint := range stmt.Constraints {
@@ -289,11 +298,11 @@ func (s *session) checkCreateTableGrammar(stmt *ast.CreateTableStmt) {
 	}
 
 	if countPrimaryKey > 1 {
-		s.AppendErrorNo(ER_MULTIPLE_PRI_KEY)
+		s.appendErrorNo(ER_MULTIPLE_PRI_KEY)
 	}
 
-	if len(stmt.Cols) == 0 && stmt.ReferTable == nil {
-		s.AppendErrorNo(ER_MUST_AT_LEAST_ONE_COLUMN)
+	if len(stmt.Cols) == 0 && stmt.ReferTable == nil && stmt.Select == nil {
+		s.appendErrorNo(ER_MUST_AT_LEAST_ONE_COLUMN)
 	}
 }
 
@@ -301,11 +310,11 @@ func (s *session) checkColumn(colDef *ast.ColumnDef) error {
 	// Check column name.
 	cName := colDef.Name.Name.String()
 	if isIncorrectName(cName) {
-		s.AppendErrorNo(ER_WRONG_COLUMN_NAME, colDef.Name.Name.O)
+		s.appendErrorNo(ER_WRONG_COLUMN_NAME, cName)
 	}
 
 	// if isInvalidDefaultValue(colDef) {
-	// 	s.AppendErrorNo(ER_INVALID_DEFAULT, colDef.Name.Name.O)
+	// 	s.AppendErrorNo(ER_INVALID_DEFAULT, cName)
 	// }
 
 	// Check column type.
@@ -314,13 +323,13 @@ func (s *session) checkColumn(colDef *ast.ColumnDef) error {
 		return nil
 	}
 	if tp.Flen > math.MaxUint32 {
-		s.AppendErrorMessage(fmt.Sprintf("Display width out of range for column '%s' (max = %d)", colDef.Name.Name.O, math.MaxUint32))
+		s.appendErrorMessage(fmt.Sprintf("Display width out of range for column '%s' (max = %d)", cName, math.MaxUint32))
 	}
 
 	switch tp.Tp {
 	case mysql.TypeString:
 		if tp.Flen != types.UnspecifiedLength && tp.Flen > mysql.MaxFieldCharLength {
-			s.AppendErrorMessage(fmt.Sprintf("Column length too big for column '%s' (max = %d); use BLOB or TEXT instead", colDef.Name.Name.O, mysql.MaxFieldCharLength))
+			s.appendErrorMessage(fmt.Sprintf("Column length too big for column '%s' (max = %d); use BLOB or TEXT instead", cName, mysql.MaxFieldCharLength))
 		}
 	case mysql.TypeVarchar:
 		maxFlen := mysql.MaxFieldVarCharLength
@@ -337,33 +346,47 @@ func (s *session) checkColumn(colDef *ast.ColumnDef) error {
 		}
 		maxFlen /= desc.Maxlen
 		if tp.Flen != types.UnspecifiedLength && tp.Flen > maxFlen {
-			s.AppendErrorMessage(fmt.Sprintf("Column length too big for column '%s' (max = %d); use BLOB or TEXT instead", colDef.Name.Name.O, maxFlen))
+			s.appendErrorMessage(fmt.Sprintf("Column length too big for column '%s' (max = %d); use BLOB or TEXT instead", cName, maxFlen))
 		}
 	case mysql.TypeFloat, mysql.TypeDouble:
 		if tp.Decimal > mysql.MaxFloatingTypeScale {
-			s.AppendErrorMessage(fmt.Sprintf("Too big scale %d specified for column '%-.192s'. Maximum is %d.", tp.Decimal, colDef.Name.Name.O, mysql.MaxFloatingTypeScale))
+			s.appendErrorMessage(fmt.Sprintf("Too big scale %d specified for column '%-.192s'. Maximum is %d.", tp.Decimal, cName, mysql.MaxFloatingTypeScale))
 		}
 		if tp.Flen > mysql.MaxFloatingTypeWidth {
 
-			s.AppendErrorMessage(fmt.Sprintf("Too big precision %d specified for column '%-.192s'. Maximum is %d.", tp.Flen, colDef.Name.Name.O, mysql.MaxFloatingTypeWidth))
+			s.appendErrorMessage(fmt.Sprintf("Too big precision %d specified for column '%-.192s'. Maximum is %d.", tp.Flen, cName, mysql.MaxFloatingTypeWidth))
 		}
 	case mysql.TypeSet:
 		if len(tp.Elems) > mysql.MaxTypeSetMembers {
-			s.AppendErrorMessage(fmt.Sprintf("Too many strings for column %s and SET", colDef.Name.Name.O))
+			s.appendErrorMessage(fmt.Sprintf("Too many strings for column %s and SET", cName))
 		}
 		// Check set elements. See https://dev.mysql.com/doc/refman/5.7/en/set.html .
 		for _, str := range colDef.Tp.Elems {
 			if strings.Contains(str, ",") {
-				s.AppendErrorMessage(fmt.Sprintf("Illegal %s '%-.192s' value found during parsing", types.TypeStr(tp.Tp), str))
+				s.appendErrorMessage(fmt.Sprintf("Illegal %s '%-.192s' value found during parsing", types.TypeStr(tp.Tp), str))
 			}
 		}
 	case mysql.TypeNewDecimal:
 		if tp.Decimal > mysql.MaxDecimalScale {
-			s.AppendErrorMessage(fmt.Sprintf("Too big scale %d specified for column '%-.192s'. Maximum is %d.", tp.Decimal, colDef.Name.Name.O, mysql.MaxDecimalScale))
+			s.appendErrorMessage(fmt.Sprintf("Too big scale %d specified for column '%-.192s'. Maximum is %d.", tp.Decimal, cName, mysql.MaxDecimalScale))
 		}
 
 		if tp.Flen > mysql.MaxDecimalWidth {
-			s.AppendErrorMessage(fmt.Sprintf("Too big precision %d specified for column '%-.192s'. Maximum is %d.", tp.Flen, colDef.Name.Name.O, mysql.MaxDecimalWidth))
+			s.appendErrorMessage(fmt.Sprintf("Too big precision %d specified for column '%-.192s'. Maximum is %d.", tp.Flen, cName, mysql.MaxDecimalWidth))
+		}
+	case mysql.TypeBit:
+		if tp.Flen <= 0 {
+			s.appendErrorMessage(fmt.Sprintf("Invalid size for column '%s'.", cName))
+		}
+		if tp.Flen > mysql.MaxBitDisplayWidth {
+			s.appendErrorMessage(fmt.Sprintf("Too big display width for column '%s' (max = %d).",
+				cName, mysql.MaxBitDisplayWidth))
+		}
+	case mysql.TypeTiny, mysql.TypeInt24, mysql.TypeLong,
+		mysql.TypeShort, mysql.TypeLonglong:
+		if tp.Flen > mysql.MaxFloatingTypeWidth {
+			s.appendErrorMessage(fmt.Sprintf("Too big display width for column '%-.192s' (max = %d).",
+				cName, mysql.MaxFloatingTypeWidth))
 		}
 	default:
 		// TODO: Add more types.
@@ -396,7 +419,7 @@ func (s *session) checkTableAliasDuplicate(node ast.ResultSetNode, tableAliases 
 
 		_, ok := tableAliases[name]
 		if len(name) != 0 && ok {
-			s.AppendErrorNo(ErrNonUniqTable, name)
+			s.appendErrorNo(ErrNonUniqTable, name)
 			return
 		}
 		tableAliases[name] = nil
@@ -429,7 +452,7 @@ func (s *session) checkOnlyFullGroupByWithOutGroupClause(fields []*ast.SelectFie
 			}
 		}
 		if hasAggFunc && firstNonAggCol != nil {
-			s.AppendErrorNo(ErrMixOfGroupFuncAndFields, firstNonAggColIdx+1, firstNonAggCol.Name.O)
+			s.appendErrorNo(ErrMixOfGroupFuncAndFields, firstNonAggColIdx+1, firstNonAggCol.Name.O)
 			return nil
 		}
 	}
@@ -453,18 +476,18 @@ func (s *session) checkOnlyFullGroupByWithGroupClause(sel *ast.SelectStmt, table
 		}
 	}
 
-	notInGbyCols := make(map[*FieldInfo]core.ErrExprLoc, len(sel.Fields.Fields))
+	notInGbyCols := make(map[*FieldInfo]ErrExprLoc, len(sel.Fields.Fields))
 	for offset, field := range sel.Fields.Fields {
 		// log.Info(field.Auxiliary, "---", field.Expr)
 		if field.Auxiliary {
 			continue
 		}
-		checkExprInGroupBy(field.Expr, offset, core.ErrExprInSelect, gbyCols, gbyExprs, notInGbyCols, tables)
+		checkExprInGroupBy(field.Expr, offset, ErrExprInSelect, gbyCols, gbyExprs, notInGbyCols, tables)
 	}
 
 	if sel.OrderBy != nil {
 		for offset, item := range sel.OrderBy.Items {
-			checkExprInGroupBy(item.Expr, offset, core.ErrExprInOrderBy, gbyCols, gbyExprs, notInGbyCols, tables)
+			checkExprInGroupBy(item.Expr, offset, ErrExprInOrderBy, gbyCols, gbyExprs, notInGbyCols, tables)
 		}
 	}
 
@@ -472,15 +495,17 @@ func (s *session) checkOnlyFullGroupByWithGroupClause(sel *ast.SelectStmt, table
 		return nil
 	}
 
-	for _, errExprLoc := range notInGbyCols {
+	for field, errExprLoc := range notInGbyCols {
 		switch errExprLoc.Loc {
-		case core.ErrExprInSelect:
-			s.AppendErrorNo(ErrFieldNotInGroupBy, errExprLoc.Offset+1, errExprLoc.Loc,
-				sel.Fields.Fields[errExprLoc.Offset].Text())
+		case ErrExprInSelect:
+			// getName(sel.Fields.Fields[errExprLoc.Offset])
+			s.appendErrorNo(ErrFieldNotInGroupBy, errExprLoc.Offset+1, errExprLoc.Loc,
+				field.Field)
 			return nil
-		case core.ErrExprInOrderBy:
-			s.AppendErrorNo(ErrFieldNotInGroupBy, errExprLoc.Offset+1, errExprLoc.Loc,
-				sel.OrderBy.Items[errExprLoc.Offset].Expr.Text())
+		case ErrExprInOrderBy:
+			// sel.OrderBy.Items[errExprLoc.Offset].Expr.Text()
+			s.appendErrorNo(ErrFieldNotInGroupBy, errExprLoc.Offset+1, errExprLoc.Loc,
+				field.Field)
 			return nil
 		}
 		return nil
@@ -489,15 +514,21 @@ func (s *session) checkOnlyFullGroupByWithGroupClause(sel *ast.SelectStmt, table
 }
 
 func checkExprInGroupBy(expr ast.ExprNode, offset int, loc string,
-	gbyCols map[*FieldInfo]struct{}, gbyExprs []ast.ExprNode, notInGbyCols map[*FieldInfo]core.ErrExprLoc, tables []*TableInfo) {
+	gbyCols map[*FieldInfo]struct{}, gbyExprs []ast.ExprNode, notInGbyCols map[*FieldInfo]ErrExprLoc, tables []*TableInfo) {
 	if _, ok := expr.(*ast.AggregateFuncExpr); ok {
 		return
 	}
+	// AnyValue可以跳过only_full_group_by检查
+	// if f, ok := expr.(*ast.FuncCallExpr); ok {
+	// 	if f.FnName.L == ast.AnyValue {
+	// 		return
+	// 	}
+	// }
 	if c, ok := expr.(*ast.ColumnNameExpr); ok {
 		col := findColumnWithList(c, tables)
 		if col != nil {
 			if _, ok := gbyCols[col]; !ok {
-				notInGbyCols[col] = core.ErrExprLoc{Offset: offset, Loc: loc}
+				notInGbyCols[col] = ErrExprLoc{Offset: offset, Loc: loc}
 			}
 		}
 	} else {

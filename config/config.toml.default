@@ -8,6 +8,9 @@ port = 4000
 # TiDB数据库目录
 path = "/tmp/tidb"
 
+# 忽略终端连接断开信号
+ignore_sighup = true
+
 [log]
 # 日志级别: debug, info, warn, error, fatal.
 level = "info"
@@ -54,6 +57,11 @@ check_column_comment = false
 # 审核列类型变更
 check_column_type_change = true
 
+# 表名/索引名前缀
+index_prefix = "idx_"
+uniq_index_prefix = "uniq_"
+table_prefix = ""
+
 # explain判断受影响行数时使用的规则, 默认值"first"
 # 可选值: "first", "max"
 #      "first":    使用第一行的explain结果作为受影响行数
@@ -65,6 +73,11 @@ explain_rule = "first"
 # 0  表示关闭安全更新
 # 1  表示开启安全更新
 sql_safe_updates = -1
+
+# 设置执行SQL时，会话变量
+# -1 表示不做操作，基于远端数据库【默认值】
+# > 0 值表示，会话在执行SQL 时获取锁超时的时间
+lock_wait_timeout = -1
 
 support_charset = "utf8,utf8mb4"
 support_engine = "innodb"
@@ -104,6 +117,15 @@ osc_recursion_method = "processlist"
 
 # 对应参数pt-online-schema-change中的参数--max-lag。默认值：3
 osc_max_lag = 3
+
+# 类似--max-lag，检查集群暂停流量控制所花费的平均时间（仅适用于PXC 5.6及以上版本,会自动检测)
+osc_max_flow_ctl = -1
+
+# 对应参数pt-online-schema-change中的参数 --sleep 默认值：0.0
+osc_sleep = 0.0
+
+# 对应参数pt-online-schema-change中的参数 --set-vars lock_wait_timeout=?
+osc_lock_wait_timeout = 60
 
 # 对应参数pt-online-schema-change中的参数--[no]check-alter。默认值：ON
 osc_check_alter = true
@@ -190,6 +212,8 @@ er_invalid_ident = 1
 er_join_no_on_condition = 1
 er_json_type_support = 2
 er_must_have_columns = 1
+er_columns_must_have_index = 1
+er_columns_must_have_index_type_err = 1
 er_no_where_condition = 1
 er_not_allowed_nullable = 1
 er_ordery_by_rand = 1
@@ -202,6 +226,7 @@ er_table_charset_must_null = 1
 er_table_charset_must_utf8 = 1
 er_table_must_have_comment = 1
 er_table_must_have_pk = 1
+er_table_prefix = 1
 er_text_not_nullable_error = 1
 er_timestamp_default = 1
 er_too_many_key_parts = 1
@@ -216,3 +241,4 @@ er_with_insert_field = 1
 er_with_limit_condition = 1
 er_with_orderby_condition = 1
 er_wrong_and_expr = 1
+er_view_support = 2

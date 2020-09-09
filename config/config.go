@@ -16,14 +16,15 @@ package config
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"strings"
+
 	// "fmt"
 	"io/ioutil"
-	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/util/logutil"
 	"github.com/pingcap/errors"
-	tracing "github.com/uber/jaeger-client-go/config"
 )
 
 // Config number limitations
@@ -68,7 +69,6 @@ type Config struct {
 	Status              Status            `toml:"status" json:"status"`
 	Performance         Performance       `toml:"performance" json:"performance"`
 	PreparedPlanCache   PreparedPlanCache `toml:"prepared-plan-cache" json:"prepared-plan-cache"`
-	OpenTracing         OpenTracing       `toml:"opentracing" json:"opentracing"`
 	ProxyProtocol       ProxyProtocol     `toml:"proxy-protocol" json:"proxy-protocol"`
 	TiKVClient          TiKVClient        `toml:"tikv-client" json:"tikv-client"`
 	Binlog              Binlog            `toml:"binlog" json:"binlog"`
@@ -80,6 +80,9 @@ type Config struct {
 
 	// 是否跳过用户权限校验
 	SkipGrantTable bool `toml:"skip_grant_table" json:"skip_grant_table"`
+
+	// 忽略终端连接断开信号
+	IgnoreSighup bool `toml:"ignore_sighup" json:"ignore_sighup"`
 }
 
 // Log is the log section of config.
@@ -93,10 +96,8 @@ type Log struct {
 	// File log config.
 	File logutil.FileLogConfig `toml:"file" json:"file"`
 
-	SlowQueryFile      string `toml:"slow-query-file" json:"slow-query-file"`
-	SlowThreshold      uint   `toml:"slow-threshold" json:"slow-threshold"`
-	ExpensiveThreshold uint   `toml:"expensive-threshold" json:"expensive-threshold"`
-	QueryLogMaxLen     uint   `toml:"query-log-max-len" json:"query-log-max-len"`
+	ExpensiveThreshold uint `toml:"expensive-threshold" json:"expensive-threshold"`
+	QueryLogMaxLen     uint `toml:"query-log-max-len" json:"query-log-max-len"`
 }
 
 // Security is the security section of the config.
@@ -182,33 +183,6 @@ type TxnLocalLatches struct {
 type PreparedPlanCache struct {
 	Enabled  bool `toml:"enabled" json:"enabled"`
 	Capacity uint `toml:"capacity" json:"capacity"`
-}
-
-// OpenTracing is the opentracing section of the config.
-type OpenTracing struct {
-	Enable     bool                `toml:"enable" json:"enbale"`
-	Sampler    OpenTracingSampler  `toml:"sampler" json:"sampler"`
-	Reporter   OpenTracingReporter `toml:"reporter" json:"reporter"`
-	RPCMetrics bool                `toml:"rpc-metrics" json:"rpc-metrics"`
-}
-
-// OpenTracingSampler is the config for opentracing sampler.
-// See https://godoc.org/github.com/uber/jaeger-client-go/config#SamplerConfig
-type OpenTracingSampler struct {
-	Type                    string        `toml:"type" json:"type"`
-	Param                   float64       `toml:"param" json:"param"`
-	SamplingServerURL       string        `toml:"sampling-server-url" json:"sampling-server-url"`
-	MaxOperations           int           `toml:"max-operations" json:"max-operations"`
-	SamplingRefreshInterval time.Duration `toml:"sampling-refresh-interval" json:"sampling-refresh-interval"`
-}
-
-// OpenTracingReporter is the config for opentracing reporter.
-// See https://godoc.org/github.com/uber/jaeger-client-go/config#ReporterConfig
-type OpenTracingReporter struct {
-	QueueSize           int           `toml:"queue-size" json:"queue-size"`
-	BufferFlushInterval time.Duration `toml:"buffer-flush-interval" json:"buffer-flush-interval"`
-	LogSpans            bool          `toml:"log-spans" json:"log-spans"`
-	LocalAgentHostPort  string        `toml:"local-agent-host-port" json:"local-agent-host-port"`
 }
 
 // ProxyProtocol is the PROXY protocol section of the config.
@@ -300,6 +274,7 @@ type Inc struct {
 	EnableForeignKey       bool `toml:"enable_foreign_key" json:"enable_foreign_key"`
 	EnableIdentiferKeyword bool `toml:"enable_identifer_keyword" json:"enable_identifer_keyword"`
 	EnableJsonType         bool `toml:"enable_json_type" json:"enable_json_type"`
+	EnableUseView          bool `toml:"enable_use_view" json:"enable_use_view"`
 	// 是否启用自定义审核级别设置
 	// EnableLevel bool `toml:"enable_level" json:"enable_level"`
 	// 是否启用最小化回滚SQL设置,当开启时,update语句中未变更的值不再记录到回滚语句中
@@ -329,8 +304,14 @@ type Inc struct {
 	GeneralLog bool `toml:"general_log" json:"general_log"`
 	// 使用十六进制表示法转储二进制列
 	// 受影响的数据类型为BINARY，VARBINARY，BLOB类型
-	HexBlob bool   `toml:"hex_blob" json:"hex_blob"`
-	Lang    string `toml:"lang" json:"lang"`
+	HexBlob bool `toml:"hex_blob" json:"hex_blob"`
+
+	// 表名/索引名前缀，为空时不作限制
+	IndexPrefix     string `toml:"index_prefix" json:"index_prefix"`
+	UniqIndexPrefix string `toml:"uniq_index_prefix" json:"uniq_index_prefix"`
+	TablePrefix     string `toml:"table_prefix" json:"table_prefix"`
+
+	Lang string `toml:"lang" json:"lang"`
 	// 连接服务器允许的最大包大小,以字节为单位 默认值为4194304(即4MB)
 	MaxAllowedPacket uint `toml:"max_allowed_packet" json:"max_allowed_packet"`
 	MaxCharLength    uint `toml:"max_char_length" json:"max_char_length"`
@@ -350,17 +331,28 @@ type Inc struct {
 
 	// 建表必须创建的列. 可指定多个列,以逗号分隔.列类型可选. 格式: 列名 [列类型,可选],...
 	MustHaveColumns string `toml:"must_have_columns" json:"must_have_columns"`
+	// 如果表包含以下列，列必须有索引。可指定多个列,以逗号分隔.列类型可选.   格式: 列名 [列类型,可选],...
+	ColumnsMustHaveIndex string `toml:"columns_must_have_index" json:"columns_must_have_index"`
 
 	// 是否跳过用户权限校验
 	SkipGrantTable bool `toml:"skip_grant_table" json:"skip_grant_table"`
 	// 要跳过的sql语句, 多个时以分号分隔
 	SkipSqls string `toml:"skip_sqls" json:"skip_sqls"`
 
+	// alter table子句忽略OSC工具.
+	// 格式为drop index,add column等,配置要跳过的子句格式,多个时以逗号分隔
+	IgnoreOscAlterStmt string `toml:"ignore_osc_alter_stmt" json:"ignore_osc_alter_stmt"`
+
 	// 安全更新是否开启.
 	// -1 表示不做操作,基于远端数据库 [默认值]
 	// 0  表示关闭安全更新
 	// 1  表示开启安全更新
 	SqlSafeUpdates int `toml:"sql_safe_updates" json:"sql_safe_updates"`
+
+	// 设置执行SQL时，会话变量
+	// 0 表示不做操作，基于远端数据库【默认值】
+	// > 0 值表示，会话在执行SQL 时获取锁超时的时间
+	LockWaitTimeout int `toml:"lock_wait_timeout" json:"lock_wait_timeout"`
 
 	// 支持的字符集
 	SupportCharset string `toml:"support_charset" json:"support_charset"`
@@ -373,6 +365,9 @@ type Inc struct {
 	SupportEngine string `toml:"support_engine" json:"support_engine"`
 	// 远端数据库等待超时时间，单位:秒
 	WaitTimeout int `toml:"wait_timeout" json:"wait_timeout"`
+
+	// 版本信息
+	Version string `toml:"version" json:"version"`
 }
 
 // Osc online schema change 工具参数配置
@@ -407,8 +402,17 @@ type Osc struct {
 	// 对应参数pt-online-schema-change中的参数--max-lag。默认值：3
 	OscMaxLag int `toml:"osc_max_lag" json:"osc_max_lag"`
 
+	// 类似--max-lag，检查集群暂停流量控制所花费的平均时间（仅适用于PXC 5.6及以上版本）
+	OscMaxFlowCtl int `toml:"osc_max_flow_ctl" json:"osc_max_flow_ctl"`
+
 	// 对应参数pt-online-schema-change中的参数--[no]check-alter。默认值：ON
 	OscCheckAlter bool `toml:"osc_check_alter" json:"osc_check_alter"`
+
+	// 对应参数pt-online-schema-change中的参数 --sleep 默认值：0.0
+	OscSleep float32 `toml:"osc_sleep" json:"osc_sleep"`
+
+	// 对应参数pt-online-schema-change中的参数 --set-vars lock_wait_timeout=60s
+	OscLockWaitTimeout int `toml:"osc_lock_wait_timeout" json:"osc_lock_wait_timeout"`
 
 	// 对应参数pt-online-schema-change中的参数--[no]check-replication-filters。默认值：ON
 	OscCheckReplicationFilters bool `toml:"osc_check_replication_filters" json:"osc_check_replication_filters"`
@@ -588,7 +592,6 @@ type IncLevel struct {
 	ER_AUTO_INCR_ID_WARNING         int8 `toml:"er_auto_incr_id_warning"`
 	ER_AUTOINC_UNSIGNED             int8 `toml:"er_autoinc_unsigned"`
 	ER_BLOB_CANT_HAVE_DEFAULT       int8 `toml:"er_blob_cant_have_default"`
-	ErCantChangeColumn              int8 `toml:"er_cant_change_column"`
 	ER_CANT_SET_CHARSET             int8 `toml:"er_cant_set_charset"`
 	ER_CANT_SET_COLLATION           int8 `toml:"er_cant_set_collation"`
 	ER_CANT_SET_ENGINE              int8 `toml:"er_cant_set_engine"`
@@ -607,6 +610,8 @@ type IncLevel struct {
 	ER_INVALID_DATA_TYPE            int8 `toml:"er_invalid_data_type"`
 	ER_INVALID_IDENT                int8 `toml:"er_invalid_ident"`
 	ER_MUST_HAVE_COLUMNS            int8 `toml:"er_must_have_columns"`
+	ErrColumnsMustHaveIndex         int8 `toml:"er_columns_must_have_index"`
+	ErrColumnsMustHaveIndexTypeErr  int8 `toml:"er_columns_must_have_index_type_err"`
 	ER_NO_WHERE_CONDITION           int8 `toml:"er_no_where_condition"`
 	ER_NOT_ALLOWED_NULLABLE         int8 `toml:"er_not_allowed_nullable"`
 	ER_ORDERY_BY_RAND               int8 `toml:"er_ordery_by_rand"`
@@ -619,6 +624,7 @@ type IncLevel struct {
 	ER_TABLE_CHARSET_MUST_UTF8      int8 `toml:"er_table_charset_must_utf8"`
 	ER_TABLE_MUST_HAVE_COMMENT      int8 `toml:"er_table_must_have_comment"`
 	ER_TABLE_MUST_HAVE_PK           int8 `toml:"er_table_must_have_pk"`
+	ER_TABLE_PREFIX                 int8 `toml:"er_table_prefix"`
 	ER_TEXT_NOT_NULLABLE_ERROR      int8 `toml:"er_text_not_nullable_error"`
 	ER_TIMESTAMP_DEFAULT            int8 `toml:"er_timestamp_default"`
 	ER_TOO_MANY_KEY_PARTS           int8 `toml:"er_too_many_key_parts"`
@@ -632,11 +638,14 @@ type IncLevel struct {
 	ER_WITH_INSERT_FIELD            int8 `toml:"er_with_insert_field"`
 	ER_WITH_LIMIT_CONDITION         int8 `toml:"er_with_limit_condition"`
 	ER_WITH_ORDERBY_CONDITION       int8 `toml:"er_with_orderby_condition"`
-	ErrWrongAndExpr                 int8 `toml:"er_wrong_and_expr"`
+	ErCantChangeColumn              int8 `toml:"er_cant_change_column"`
 	ErCantChangeColumnPosition      int8 `toml:"er_cant_change_column_position"`
 	ErJsonTypeSupport               int8 `toml:"er_json_type_support"`
-	ErrJoinNoOnCondition            int8 `toml:"er_join_no_on_condition"`
 	ErrImplicitTypeConversion       int8 `toml:"er_implicit_type_conversion"`
+	ErrJoinNoOnCondition            int8 `toml:"er_join_no_on_condition"`
+	ErrUseValueExpr                 int8 `toml:"er_use_value_expr"`
+	ErrWrongAndExpr                 int8 `toml:"er_wrong_and_expr"`
+	ErrViewSupport                  int8 `toml:"er_view_support"`
 }
 
 var defaultConf = Config{
@@ -666,7 +675,6 @@ var defaultConf = Config{
 			LogRotate: true,
 			MaxSize:   logutil.DefaultLogMaxSize,
 		},
-		SlowThreshold:      300,
 		ExpensiveThreshold: 10000,
 		QueryLogMaxLen:     2048,
 	},
@@ -696,14 +704,6 @@ var defaultConf = Config{
 		Enabled:  false,
 		Capacity: 100,
 	},
-	OpenTracing: OpenTracing{
-		Enable: false,
-		Sampler: OpenTracingSampler{
-			Type:  "const",
-			Param: 1.0,
-		},
-		Reporter: OpenTracingReporter{},
-	},
 	TiKVClient: TiKVClient{
 		GrpcConnectionCount:  16,
 		GrpcKeepAliveTime:    10,
@@ -716,6 +716,7 @@ var defaultConf = Config{
 	// 默认跳过权限校验 2019-1-26
 	// 为配置方便,在config节点也添加相同参数
 	SkipGrantTable: true,
+	IgnoreSighup:   true,
 	Security: Security{
 		SkipGrantTable: true,
 	},
@@ -732,6 +733,7 @@ var defaultConf = Config{
 		CheckFloatDouble:      false,
 		CheckIdentifierUpper:  false,
 		SqlSafeUpdates:        -1,
+		LockWaitTimeout:       -1,
 		SupportCharset:        "utf8,utf8mb4",
 		SupportEngine:         "innodb",
 		Lang:                  "en-US",
@@ -744,7 +746,13 @@ var defaultConf = Config{
 
 		// 为配置方便,在config节点也添加相同参数
 		SkipGrantTable: true,
-		// Version:            &mysql.TiDBReleaseVersion,
+
+		// 默认参数不指定,避免test时失败
+		// Version:            mysql.TiDBReleaseVersion,
+
+		IndexPrefix:     "idx_",  // 默认不检查,由CheckIndexPrefix控制
+		UniqIndexPrefix: "uniq_", // 默认不检查,由CheckIndexPrefix控制
+		TablePrefix:     "",      // 默认不检查表前缀
 	},
 	Osc: Osc{
 		OscPrintNone:               false,
@@ -754,6 +762,9 @@ var defaultConf = Config{
 		OscAlterForeignKeysMethod:  "none",
 		OscRecursionMethod:         "processlist",
 		OscMaxLag:                  3,
+		OscMaxFlowCtl:              -1,
+		OscSleep:                   0.0,
+		OscLockWaitTimeout:         60,
 		OscCheckAlter:              true,
 		OscCheckReplicationFilters: true,
 		OscCheckUniqueKeyChange:    true,
@@ -791,7 +802,6 @@ var defaultConf = Config{
 		ER_AUTO_INCR_ID_WARNING:         1,
 		ER_AUTOINC_UNSIGNED:             1,
 		ER_BLOB_CANT_HAVE_DEFAULT:       1,
-		ErCantChangeColumn:              1,
 		ER_CANT_SET_CHARSET:             1,
 		ER_CANT_SET_COLLATION:           1,
 		ER_CANT_SET_ENGINE:              1,
@@ -810,8 +820,9 @@ var defaultConf = Config{
 		ER_INVALID_DATA_TYPE:            1,
 		ER_INVALID_IDENT:                1,
 		ER_MUST_HAVE_COLUMNS:            1,
+		ErrColumnsMustHaveIndex:         1,
+		ErrColumnsMustHaveIndexTypeErr:  1,
 		ER_NO_WHERE_CONDITION:           1,
-		ErrJoinNoOnCondition:            1,
 		ER_NOT_ALLOWED_NULLABLE:         1,
 		ER_ORDERY_BY_RAND:               1,
 		ER_PARTITION_NOT_ALLOWED:        1,
@@ -823,6 +834,7 @@ var defaultConf = Config{
 		ER_TABLE_CHARSET_MUST_UTF8:      1,
 		ER_TABLE_MUST_HAVE_COMMENT:      1,
 		ER_TABLE_MUST_HAVE_PK:           1,
+		ER_TABLE_PREFIX:                 1,
 		ER_TEXT_NOT_NULLABLE_ERROR:      1,
 		ER_TIMESTAMP_DEFAULT:            1,
 		ER_TOO_MANY_KEY_PARTS:           1,
@@ -836,10 +848,14 @@ var defaultConf = Config{
 		ER_WITH_INSERT_FIELD:            1,
 		ER_WITH_LIMIT_CONDITION:         1,
 		ER_WITH_ORDERBY_CONDITION:       1,
-		ErrWrongAndExpr:                 1,
+		ErCantChangeColumn:              1,
 		ErCantChangeColumnPosition:      1,
 		ErJsonTypeSupport:               2,
 		ErrImplicitTypeConversion:       1,
+		ErrJoinNoOnCondition:            1,
+		ErrUseValueExpr:                 1,
+		ErrWrongAndExpr:                 1,
+		ErrViewSupport:                  2,
 	},
 }
 
@@ -855,6 +871,8 @@ func NewConfig() *Config {
 // It should store configuration from command line and configuration file.
 // Other parts of the system can read the global configuration use this function.
 func GetGlobalConfig() *Config {
+	// 自动设置版本号
+	globalConf.Inc.Version = strings.TrimRight(mysql.TiDBReleaseVersion, "-dirty")
 	return &globalConf
 }
 
@@ -874,29 +892,7 @@ func (l *Log) ToLogConfig() *logutil.LogConfig {
 		Format:           l.Format,
 		DisableTimestamp: l.DisableTimestamp,
 		File:             l.File,
-		SlowQueryFile:    l.SlowQueryFile,
 	}
-}
-
-// ToTracingConfig converts *OpenTracing to *tracing.Configuration.
-func (t *OpenTracing) ToTracingConfig() *tracing.Configuration {
-	ret := &tracing.Configuration{
-		Disabled:   !t.Enable,
-		RPCMetrics: t.RPCMetrics,
-		Reporter:   &tracing.ReporterConfig{},
-		Sampler:    &tracing.SamplerConfig{},
-	}
-	ret.Reporter.QueueSize = t.Reporter.QueueSize
-	ret.Reporter.BufferFlushInterval = t.Reporter.BufferFlushInterval
-	ret.Reporter.LogSpans = t.Reporter.LogSpans
-	ret.Reporter.LocalAgentHostPort = t.Reporter.LocalAgentHostPort
-
-	ret.Sampler.Type = t.Sampler.Type
-	ret.Sampler.Param = t.Sampler.Param
-	ret.Sampler.SamplingServerURL = t.Sampler.SamplingServerURL
-	ret.Sampler.MaxOperations = t.Sampler.MaxOperations
-	ret.Sampler.SamplingRefreshInterval = t.Sampler.SamplingRefreshInterval
-	return ret
 }
 
 func init() {

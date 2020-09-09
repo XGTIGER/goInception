@@ -21,6 +21,13 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/hanchuanchuan/goInception/ast"
 	"github.com/hanchuanchuan/goInception/config"
 	"github.com/hanchuanchuan/goInception/domain"
@@ -29,7 +36,6 @@ import (
 	"github.com/hanchuanchuan/goInception/meta"
 	"github.com/hanchuanchuan/goInception/model"
 	"github.com/hanchuanchuan/goInception/mysql"
-	"github.com/hanchuanchuan/goInception/owner"
 	"github.com/hanchuanchuan/goInception/parser"
 	plannercore "github.com/hanchuanchuan/goInception/planner/core"
 	"github.com/hanchuanchuan/goInception/privilege"
@@ -52,14 +58,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tipb/go-binlog"
 	log "github.com/sirupsen/logrus"
-	"go.uber.org/zap"
 	"golang.org/x/net/context"
-	"net"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/jinzhu/gorm"
 )
@@ -95,9 +94,12 @@ type Session interface {
 	// FieldList returns fields list of a table.
 	FieldList(tableName string) (fields []*ast.ResultField, err error)
 
-	// HaveBegin() bool
-	// HaveCommit() bool
-	// RecordSets() *MyRecordSets
+	// 用以测试
+	GetAlterTablePostPart(sql string, isPtOSC bool) string
+
+	LoadOptions(opt SourceOptions) error
+	Audit(ctx context.Context, sql string) ([]Record, error)
+	RunExecute(ctx context.Context, sql string) ([]Record, error)
 }
 
 var (
@@ -152,20 +154,23 @@ type session struct {
 	sessionManager util.SessionManager
 
 	statsCollector *statistics.SessionStatsCollector
-	// ddlOwnerChecker is used in `select tidb_is_ddl_owner()` statement;
-	ddlOwnerChecker owner.DDLOwnerChecker
 
 	haveBegin  bool
 	haveCommit bool
+	// 标识API请求
+	isAPI bool
 
 	recordSets *MyRecordSets
 
-	opt *sourceOptions
+	opt *SourceOptions
 
 	db       *gorm.DB
 	backupdb *gorm.DB
 
-	DBName string
+	// 执行DDL操作的数据库连接. 仅用于事务功能
+	ddlDB *gorm.DB
+
+	dbName string
 
 	myRecord *Record
 
@@ -177,12 +182,12 @@ type session struct {
 	// 备份库中的备份表
 	backupTableCacheList map[string]bool
 
-	Inc   config.Inc
-	Osc   config.Osc
-	Ghost config.Ghost
+	inc   config.Inc
+	osc   config.Osc
+	ghost config.Ghost
 
 	// 异步备份的通道
-	ch chan *ChanData
+	ch chan *chanData
 
 	// 批量写入表$_$Inception_backup_information$_$
 	chBackupRecord chan *chanBackup
@@ -197,13 +202,13 @@ type session struct {
 	lastBackupTable string
 
 	// 总的操作行数,当备份时用以计算备份进度
-	TotalChangeRows int
-	BackupTotalRows int
+	totalChangeRows int
+	backupTotalRows int
 
 	// 数据库类型
-	DBType int
+	dbType int
 	// 数据库版本号
-	DBVersion int
+	dbVersion int
 
 	// 远程数据库线程ID,在启用备份功能时,用以记录线程ID来解析binlog
 	threadID uint32
@@ -220,6 +225,14 @@ type session struct {
 
 	// 时间戳类型是否需要明确指定默认值
 	explicitDefaultsForTimestamp bool
+
+	// 强制执行GTID一致性.
+	// 当启用 enforce_gtid_consistency 功能的时候，MySQL只允许能够保障事务安全，并且能够被日志记录的SQL语句被执行，
+	// 像create table … select 和 create temporarytable语句，以及同时更新事务表和非事务表的SQL语句或事务都不允许执行
+	enforeGtidConsistency bool
+
+	// 数据库的GTID模式会影响enforce_gtid_consistency参数.
+	gtidMode string
 
 	// 判断kill操作在哪个阶段,如果是在执行阶段时,则不停止备份
 	killExecute bool
@@ -238,12 +251,9 @@ type session struct {
 	// 目标数据库的innodb_large_prefix设置
 	innodbLargePrefix bool
 	// 目标数据库的lower-case-table-names设置, 默认值为1,即不区分大小写
-	LowerCaseTableNames int
-}
-
-// DDLOwnerChecker returns s.ddlOwnerChecker.
-func (s *session) DDLOwnerChecker() owner.DDLOwnerChecker {
-	return s.ddlOwnerChecker
+	lowerCaseTableNames int
+	// PXC集群节点
+	isClusterNode bool
 }
 
 func (s *session) getMembufCap() int {
@@ -312,6 +322,10 @@ func (s *session) SetCollation(coID int) error {
 	}
 	terror.Log(errors.Trace(s.sessionVars.SetSystemVar(variable.CollationConnection, co)))
 	return nil
+}
+
+func (s *session) GetAlterTablePostPart(sql string, isPtOSC bool) string {
+	return s.getAlterTablePostPart(sql, isPtOSC)
 }
 
 func (s *session) PreparedPlanCache() *kvcache.SimpleLRUCache {
@@ -670,7 +684,7 @@ func (s *session) ExecRestrictedSQLWithSnapshot(sctx sessionctx.Context, sql str
 		}
 		defer func() {
 			if err := se.sessionVars.SetSystemVar(variable.TiDBSnapshot, ""); err != nil {
-				log.Error("set tidbSnapshot error", zap.Error(err))
+				log.Error("set tidbSnapshot error", err)
 			}
 		}()
 	}
@@ -1316,22 +1330,10 @@ func createSession(store kv.Storage) (*session, error) {
 		return nil, errors.Trace(err)
 	}
 	s := &session{
-		store:           store,
-		parser:          parser.New(),
-		sessionVars:     variable.NewSessionVars(),
-		ddlOwnerChecker: dom.DDL().OwnerManager(),
-
-		LowerCaseTableNames: 1,
-		// haveBegin:  false,
-		// haveCommit: false,
-
-		// tableCacheList: make(map[string]*TableInfo),
-		// dbCacheList:    make(map[string]bool),
-
-		// backupDBCacheList:    make(map[string]bool),
-		// backupTableCacheList: make(map[string]bool),
-
-		// Inc: config.GetGlobalConfig().Inc,
+		store:               store,
+		parser:              parser.New(),
+		sessionVars:         variable.NewSessionVars(),
+		lowerCaseTableNames: 1,
 	}
 
 	if plannercore.PreparedPlanCacheEnabled() {

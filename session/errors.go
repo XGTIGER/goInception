@@ -20,18 +20,14 @@ package session
 import (
 	"fmt"
 	// "strconv"
-	"strings"
 
 	"github.com/hanchuanchuan/goInception/config"
 	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/terror"
-	log "github.com/sirupsen/logrus"
 )
 
 //go:generate stringer -type=ErrorCode
 type ErrorCode int
-
-var ErrorsMessage = map[ErrorCode]string{}
 
 var (
 	ErrWrongValueForVar = terror.ClassVariable.New(mysql.ErrWrongValueForVar,
@@ -95,6 +91,7 @@ const (
 	ER_TOO_LONG_INDEX_COMMENT
 	ER_DUP_INDEX
 	ER_TEMP_TABLE_TMP_PREFIX
+	ER_TABLE_PREFIX
 	ER_TABLE_CHARSET_MUST_UTF8
 	ER_TABLE_CHARSET_MUST_NULL
 	ER_TABLE_MUST_HAVE_COMMENT
@@ -180,6 +177,8 @@ const (
 	ER_CANT_SET_ENGINE
 	ER_MUST_AT_LEAST_ONE_COLUMN
 	ER_MUST_HAVE_COLUMNS
+	ErrColumnsMustHaveIndex
+	ErrColumnsMustHaveIndexTypeErr
 	ER_PRIMARY_CANT_HAVE_NULL
 	ErrCantRemoveAllFields
 	ErrNotFoundTableInfo
@@ -207,6 +206,10 @@ const (
 	ErrFkDupName
 	ErrJoinNoOnCondition
 	ErrImplicitTypeConversion
+	ErrUseValueExpr
+	ErrUseIndexVisibility
+	ErrViewSupport
+	ErrViewColumnCount
 	ER_ERROR_LAST
 )
 
@@ -226,12 +229,12 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_BAD_FIELD_ERROR:                     "Unknown column '%s' in '%s'.",
 	ER_FIELD_SPECIFIED_TWICE:               "Column '%s' specified twice in table '%s'.",
 	ER_BAD_NULL_ERROR:                      "Column '%s' cannot be null in %d row.",
-	ER_NO_WHERE_CONDITION:                  "set the where condition for select statement.",
+	ER_NO_WHERE_CONDITION:                  "Please set the where condition.",
 	ER_NORMAL_SHUTDOWN:                     "%s: Normal shutdown\n",
 	ER_FORCING_CLOSE:                       "%s: Forcing close of thread %ld  user: '%s'\n",
 	ER_CON_COUNT_ERROR:                     "Too many connections",
 	ER_INVALID_COMMAND:                     "Invalid command.",
-	ER_SQL_INVALID_SOURCE:                  "Invalid source infomation.",
+	ER_SQL_INVALID_SOURCE:                  "Invalid source infomation(%s).",
 	ER_WRONG_DB_NAME:                       "Incorrect database name '%s'.",
 	ER_NO_DB_ERROR:                         "No database selected.",
 	ER_WITH_LIMIT_CONDITION:                "Limit is not allowed in update/delete statement.",
@@ -263,6 +266,7 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_TOO_LONG_INDEX_COMMENT:              "Comment for index '%s' is too long (max = %lu).",
 	ER_DUP_INDEX:                           "Duplicate index '%s' defined on the table '%s.%s'.",
 	ER_TEMP_TABLE_TMP_PREFIX:               "Set 'tmp' prefix for temporary table.",
+	ER_TABLE_PREFIX:                        "Need set '%s' prefix for table.",
 	ER_TABLE_CHARSET_MUST_UTF8:             "Set charset to one of '%s' for table '%s'.",
 	ER_TABLE_CHARSET_MUST_NULL:             "Not allowed set charset for table '%s'.",
 	ErrTableCollationNotSupport:            "Not allowed set collation for table '%s'.",
@@ -299,7 +303,7 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_END_WITH_COMMIT:                     "Must end with commit.",
 	ER_DB_NOT_EXISTED_ERROR:                "Selected Database '%s' not existed.",
 	ER_TABLE_EXISTS_ERROR:                  "Table '%s' already exists.",
-	ER_INDEX_NAME_IDX_PREFIX:               "Index '%s' in table '%s' need 'idx_' prefix.",
+	ER_INDEX_NAME_IDX_PREFIX:               "Index '%s' in table '%s' need '%s' prefix.",
 	ER_INDEX_NAME_UNIQ_PREFIX:              "Index '%s' in table '%s' need 'uniq_' prefix.",
 	ER_AUTOINC_UNSIGNED:                    "Set unsigned attribute on auto increment column in table '%s'.",
 	ER_VARCHAR_TO_TEXT_LEN:                 "Set column '%s' to TEXT type.",
@@ -309,7 +313,7 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_WRONG_ARGUMENTS:                     "Incorrect arguments to %s.",
 	ER_SET_DATA_TYPE_INT_BIGINT:            "Set auto-increment data type to int or bigint.",
 	ER_TIMESTAMP_DEFAULT:                   "Set default value for timestamp column '%s'.",
-	ER_CHARSET_ON_COLUMN:                   "Not Allowed set charset for column '%s.%s'.",
+	ER_CHARSET_ON_COLUMN:                   "Not Allowed set charset or collation for column '%s.%s'.",
 	ER_AUTO_INCR_ID_WARNING:                "Auto increment column '%s' is meaningful? it's dangerous!",
 	ER_ALTER_TABLE_ONCE:                    "Merge the alter statement for table '%s' to ONE.",
 	ER_BLOB_CANT_HAVE_DEFAULT:              "BLOB, TEXT, GEOMETRY or JSON column '%s' can't have a default value.",
@@ -349,6 +353,8 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_CANT_SET_ENGINE:                     "Cannot set engine '%s'",
 	ER_MUST_AT_LEAST_ONE_COLUMN:            "A table must have at least 1 column.",
 	ER_MUST_HAVE_COLUMNS:                   "Must have the specified column: '%s'.",
+	ErrColumnsMustHaveIndex:                "The specified column: '%s' must have index.",
+	ErrColumnsMustHaveIndexTypeErr:         "The specified column: '%s' type must be '%s',current is '%s'.",
 	ER_PRIMARY_CANT_HAVE_NULL:              "All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, use UNIQUE instead",
 	ErrCantRemoveAllFields:                 "You can't delete all columns with ALTER TABLE; use DROP TABLE instead",
 	ErrNotFoundTableInfo:                   "Skip backup because there is no table structure information.",
@@ -377,6 +383,10 @@ var ErrorsDefault = map[ErrorCode]string{
 	ErrFkDupName:                   "Duplicate foreign key constraint name '%s'",
 	ErrJoinNoOnCondition:           "set the on clause for join statement.",
 	ErrImplicitTypeConversion:      "Implicit type conversion is not allowed(column '%s.%s',type '%s').",
+	ErrUseValueExpr:                "Please confirm if you want to use value expression in where condition.",
+	ErrUseIndexVisibility:          "The back-end database does not support the index to specify the visible option.",
+	ErrViewSupport:                 "Not allowed to create or use views '%s'.",
+	ErrViewColumnCount:             "View's SELECT and view's field list have different column counts",
 	ER_ERROR_LAST:                  "TheLastError,ByeBye",
 }
 
@@ -395,12 +405,12 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_BAD_FIELD_ERROR:                  "Unknown column '%s' in '%s'.",
 	ER_FIELD_SPECIFIED_TWICE:            "列 '%s' 指定重复(表 '%s').",
 	ER_BAD_NULL_ERROR:                   "列 '%s' 不能为null(第 %d 行).",
-	ER_NO_WHERE_CONDITION:               "selete语句请指定where条件.",
+	ER_NO_WHERE_CONDITION:               "请指定where条件.",
 	ER_NORMAL_SHUTDOWN:                  "%s: Normal shutdown\n",
 	ER_FORCING_CLOSE:                    "%s: Forcing close of thread %ld  user: '%s'\n",
 	ER_CON_COUNT_ERROR:                  "Too many connections",
 	ER_INVALID_COMMAND:                  "Invalid command.",
-	ER_SQL_INVALID_SOURCE:               "不正确的数据源信息.",
+	ER_SQL_INVALID_SOURCE:               "不正确的数据源信息(%s).",
 	ER_WRONG_DB_NAME:                    "不正确的的数据库名 '%s'.",
 	ER_NO_DB_ERROR:                      "没有选择数据库.",
 	ER_WITH_LIMIT_CONDITION:             "update/delete语句不允许Limit.",
@@ -432,6 +442,7 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_TOO_LONG_INDEX_COMMENT:              "索引 '%s' 注释过长(max = %lu).",
 	ER_DUP_INDEX:                           "索引 '%s' 定义重复(表'%s.%s').",
 	ER_TEMP_TABLE_TMP_PREFIX:               "临时表需要指定'tmp'前缀",
+	ER_TABLE_PREFIX:                        "表名需要指定'%s'前缀",
 	ER_TABLE_CHARSET_MUST_UTF8:             "允许的字符集为: '%s'(表'%s').",
 	ER_TABLE_CHARSET_MUST_NULL:             "表 '%s' 禁止设置字符集!",
 	ErrTableCollationNotSupport:            "表 '%s' 禁止设置排序规则!",
@@ -468,8 +479,8 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_END_WITH_COMMIT:                     "Must end with commit.",
 	ER_DB_NOT_EXISTED_ERROR:                "选择的数据库 '%s' 不存在.",
 	ER_TABLE_EXISTS_ERROR:                  "表 '%s' 已存在.",
-	ER_INDEX_NAME_IDX_PREFIX:               "索引 '%s' 需要以'idx_'为前缀(表'%s').",
-	ER_INDEX_NAME_UNIQ_PREFIX:              "索引 '%s' 需要以'uniq_'为前缀(表'%s').",
+	ER_INDEX_NAME_IDX_PREFIX:               "索引 '%s' 需要指定'%s'前缀(表'%s').",
+	ER_INDEX_NAME_UNIQ_PREFIX:              "唯一索引 '%s' 需要指定'%s'前缀(表'%s').",
 	ER_AUTOINC_UNSIGNED:                    "自增列建议设置无符号标志unsigned(表'%s').",
 	ER_VARCHAR_TO_TEXT_LEN:                 "列 '%s' 建议设置为text类型.",
 	ER_CHAR_TO_VARCHAR_LEN:                 "列 '%s' 建议设置为varchar类型.",
@@ -478,7 +489,7 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_WRONG_ARGUMENTS:                     "Incorrect arguments to %s.",
 	ER_SET_DATA_TYPE_INT_BIGINT:            "自增列需要设置为int或bigint类型.",
 	ER_TIMESTAMP_DEFAULT:                   "请设置timestamp列 '%s' 的默认值.",
-	ER_CHARSET_ON_COLUMN:                   "表 '%s' 列 '%s' 禁止设置字符集!",
+	ER_CHARSET_ON_COLUMN:                   "表 '%s' 列 '%s' 禁止设置字符集或排序规则!",
 	ER_AUTO_INCR_ID_WARNING:                "自增列('%s')建议命名为'ID'.",
 	ER_ALTER_TABLE_ONCE:                    "表 '%s' 的多个alter操作请合并成一个.",
 	ER_BLOB_CANT_HAVE_DEFAULT:              "BLOB,TEXT,GEOMETRY或JSON列 '%s' 禁止设置默认值.",
@@ -518,6 +529,8 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_CANT_SET_ENGINE:                     "禁止指定存储引擎:'%s'",
 	ER_MUST_AT_LEAST_ONE_COLUMN:            "表至少需要有一个列.",
 	ER_MUST_HAVE_COLUMNS:                   "表必须包含以下列: '%s'.",
+	ErrColumnsMustHaveIndex:                "列: '%s' 必须建索引.",
+	ErrColumnsMustHaveIndexTypeErr:         "列: '%s' 类型必须为 '%s',当前为 '%s'",
 	ER_PRIMARY_CANT_HAVE_NULL:              "主键的所有列必须为NOT NULL,如需要NULL列,请改用唯一索引",
 	ErrCantRemoveAllFields:                 "禁止删除表的所有列.",
 	ErrNotFoundTableInfo:                   "没有表结构信息,跳过备份.",
@@ -539,6 +552,10 @@ var ErrorsChinese = map[ErrorCode]string{
 	ErrWrongAndExpr:                        "可能是错误语法!更新多个字段时请使用逗号分隔.",
 	ErrJoinNoOnCondition:                   "join语句请指定on子句.",
 	ErrImplicitTypeConversion:              "不允许隐式类型转换(列'%s.%s',类型'%s').",
+	ErrUseValueExpr:                        "请确认是否要在where条件中使用值表达式.",
+	ErrUseIndexVisibility:                  "后端数据库暂不支持索引指定visible选项",
+	ErrViewSupport:                         "不允许创建或使用视图 '%s'.",
+	ErrViewColumnCount:                     "视图的SELECT和视图字段列表具有不同的列数",
 }
 
 func GetErrorLevel(code ErrorCode) uint8 {
@@ -559,10 +576,14 @@ func GetErrorLevel(code ErrorCode) uint8 {
 		ER_INC_INIT_ERR,
 		ER_INDEX_NAME_IDX_PREFIX,
 		ER_INDEX_NAME_UNIQ_PREFIX,
+		ER_TEMP_TABLE_TMP_PREFIX,
+		ER_TABLE_PREFIX,
 		ER_INSERT_TOO_MUCH_ROWS,
 		ER_INVALID_DATA_TYPE,
 		ER_INVALID_IDENT,
 		ER_MUST_HAVE_COLUMNS,
+		ErrColumnsMustHaveIndex,
+		ErrColumnsMustHaveIndexTypeErr,
 		ER_NO_WHERE_CONDITION,
 		ErrJoinNoOnCondition,
 		ER_NOT_ALLOWED_NULLABLE,
@@ -597,6 +618,7 @@ func GetErrorLevel(code ErrorCode) uint8 {
 		ER_DATETIME_DEFAULT,
 		ErrWrongAndExpr,
 		ErrImplicitTypeConversion,
+		ErrUseValueExpr,
 		ER_WITH_INSERT_FIELD:
 		return 1
 
@@ -614,7 +636,6 @@ func GetErrorLevel(code ErrorCode) uint8 {
 		ER_INVALID_DEFAULT,
 		ER_NOT_SUPPORTED_KEY_TYPE,
 		ER_DUP_INDEX,
-		ER_TEMP_TABLE_TMP_PREFIX,
 		ER_TOO_LONG_KEY,
 		ER_MULTIPLE_PRI_KEY,
 		ER_DUP_KEYNAME,
@@ -663,11 +684,14 @@ func GetErrorLevel(code ErrorCode) uint8 {
 	}
 }
 
-func GetErrorMessage(ErrorCode ErrorCode) string {
-	if v, ok := ErrorsMessage[ErrorCode]; ok {
-		return v
+// GetErrorMessage 获取审核信息,默认为英文
+func GetErrorMessage(code ErrorCode, lang string) string {
+	if lang == "zh_cn" || lang == "zh-cn" {
+		if v, ok := ErrorsChinese[code]; ok {
+			return v
+		}
 	}
-	if v, ok := ErrorsDefault[ErrorCode]; ok {
+	if v, ok := ErrorsDefault[code]; ok {
 		return v
 	}
 	return "Invalid error code!"
@@ -687,7 +711,7 @@ func (e *SQLError) Error() string {
 // NewErr generates a SQL error, with an error code and default format specifier defined in MySQLErrName.
 func NewErr(errCode ErrorCode, args ...interface{}) *SQLError {
 	e := &SQLError{Code: errCode}
-	e.Message = fmt.Sprintf(GetErrorMessage(errCode), args...)
+	e.Message = fmt.Sprintf(GetErrorMessage(errCode, "en_us"), args...)
 	return e
 }
 
@@ -696,18 +720,6 @@ func NewErrf(format string, args ...interface{}) *SQLError {
 	e := &SQLError{Code: 0}
 	e.Message = fmt.Sprintf(format, args...)
 	return e
-}
-
-func SetLanguage(langStr string) {
-	lang := strings.Replace(strings.ToLower(langStr), "-", "_", 1)
-	if lang == "zh_cn" {
-		ErrorsMessage = ErrorsChinese
-	} else {
-		ErrorsMessage = ErrorsDefault
-		if lang != "en_us" {
-			log.Warning("Lang set Error! use default en-US.")
-		}
-	}
 }
 
 func (e ErrorCode) String() string {
@@ -816,6 +828,8 @@ func (e ErrorCode) String() string {
 		return "er_dup_index"
 	case ER_TEMP_TABLE_TMP_PREFIX:
 		return "er_temp_table_tmp_prefix"
+	case ER_TABLE_PREFIX:
+		return "er_table_prefix"
 	case ER_TABLE_CHARSET_MUST_UTF8:
 		return "er_table_charset_must_utf8"
 	case ER_TABLE_CHARSET_MUST_NULL:
@@ -986,6 +1000,10 @@ func (e ErrorCode) String() string {
 		return "er_must_at_least_one_column"
 	case ER_MUST_HAVE_COLUMNS:
 		return "er_must_have_columns"
+	case ErrColumnsMustHaveIndex:
+		return "er_columns_must_have_index"
+	case ErrColumnsMustHaveIndexTypeErr:
+		return "er_columns_must_have_index_type_err"
 	case ER_PRIMARY_CANT_HAVE_NULL:
 		return "er_primary_cant_have_null"
 	case ErrCantRemoveAllFields:
@@ -1030,15 +1048,20 @@ func (e ErrorCode) String() string {
 		return "er_join_no_on_condition"
 	case ErrImplicitTypeConversion:
 		return "er_implicit_type_conversion"
+	case ErrUseValueExpr:
+		return "er_use_value_expr"
+	case ErrUseIndexVisibility:
+		return "er_use_index_visibility"
+	case ErrViewSupport:
+		return "er_view_support"
 	case ER_ERROR_LAST:
 		return "er_error_last"
 	}
 	return ""
 }
 
-// CheckAuditSetting 自动校准旧的审核规则和自定义规则
-func CheckAuditSetting(cnf *config.Config) {
-	return
+// TestCheckAuditSetting 自动校准旧的审核规则和自定义规则
+func TestCheckAuditSetting(cnf *config.Config) {
 
 	if cnf.Inc.CheckInsertField {
 		cnf.IncLevel.ER_WITH_INSERT_FIELD = int8(GetErrorLevel(ER_WITH_INSERT_FIELD))
@@ -1100,6 +1123,12 @@ func CheckAuditSetting(cnf *config.Config) {
 		cnf.IncLevel.ErJsonTypeSupport = int8(GetErrorLevel(ErrJsonTypeSupport))
 	} else {
 		cnf.IncLevel.ErJsonTypeSupport = 0
+	}
+
+	if !cnf.Inc.EnableUseView {
+		cnf.IncLevel.ErrViewSupport = int8(GetErrorLevel(ErrViewSupport))
+	} else {
+		cnf.IncLevel.ErrViewSupport = 0
 	}
 
 	if cnf.Inc.EnablePKColumnsOnlyInt {
@@ -1227,9 +1256,9 @@ func CheckAuditSetting(cnf *config.Config) {
 	}
 
 	if cnf.Inc.EnableChangeColumn {
-		cnf.IncLevel.ErCantChangeColumn = int8(GetErrorLevel(ErCantChangeColumn))
-	} else {
 		cnf.IncLevel.ErCantChangeColumn = 0
+	} else {
+		cnf.IncLevel.ErCantChangeColumn = int8(GetErrorLevel(ErCantChangeColumn))
 	}
 
 	if !cnf.Inc.EnableBlobNotNull {
